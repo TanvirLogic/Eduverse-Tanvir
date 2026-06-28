@@ -5,6 +5,9 @@ import 'package:edtech/global/core/services/upload_notification_service.dart';
 import 'package:media_kit/media_kit.dart';
 
 Future<void> initPlatformServices() async {
+  // Initialize file-based logging first so all subsequent logs are captured
+  await AppLogger.init();
+
   MediaKit.ensureInitialized();
   await UploadNotificationService.init();
   await _requestNotificationPermissionEarly();

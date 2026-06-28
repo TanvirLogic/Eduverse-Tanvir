@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -918,7 +919,7 @@ object NotificationService {
                             taskWorker.setForegroundNotification(
                                 taskWorker.notificationId,
                                 androidNotification,
-                                FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                                FOREGROUND_SERVICE_TYPE_DATA_SYNC or FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                             )
                         } else {
                             taskWorker.setForegroundNotification(

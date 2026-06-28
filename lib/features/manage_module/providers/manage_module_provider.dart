@@ -729,6 +729,22 @@ class ManageModuleProvider extends ChangeNotifier {
     try {
       final allDb = await UploadQueueRepository.getActive();
       final dbMap = {for (final item in allDb) item.id: item};
+      // Also fetch failed items we're tracking so they remain visible
+      // in the UI (otherwise getActive() excludes 'failed' status and
+      // the item silently vanishes from the pending list below).
+      if (_pendingLessons.isNotEmpty) {
+        final failedIds = _pendingLessons.keys.where(
+          (id) => !dbMap.containsKey(id),
+        ).toList();
+        if (failedIds.isNotEmpty) {
+          final allItems = await UploadQueueRepository.getAll();
+          for (final item in allItems) {
+            if (failedIds.contains(item.id)) {
+              dbMap[item.id!] = item;
+            }
+          }
+        }
+      }
       bool updated = false;
       final completedIds = <int>[];
 

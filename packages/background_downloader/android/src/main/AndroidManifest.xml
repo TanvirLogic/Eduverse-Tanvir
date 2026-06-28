@@ -30,7 +30,11 @@
             android:name=".UIDTJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="true"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|specialUse">
+            <property
+                android:name="android.foregroundservice.specialuse.PURPOSE_KEY"
+                android:value="long_running_video_upload" />
+        </service>
 
     </application>
 </manifest>

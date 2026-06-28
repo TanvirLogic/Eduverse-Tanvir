@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -29,6 +30,7 @@ class VideosHorizontalListView extends StatefulWidget {
 class _VideosHorizontalListViewState extends State<VideosHorizontalListView> {
   int _activeIndex = -1;
   bool _showControls = true;
+  Timer? _controlHideTimer;
 
   final Map<int, Uint8List> _thumbnailCache = {};
 
@@ -49,6 +51,7 @@ class _VideosHorizontalListViewState extends State<VideosHorizontalListView> {
 
   @override
   void dispose() {
+    _controlHideTimer?.cancel();
     context.read<VideoPlayerProvider>().dismiss();
     super.dispose();
   }
@@ -74,12 +77,19 @@ class _VideosHorizontalListViewState extends State<VideosHorizontalListView> {
   }
 
   void _startControlHideTimer() {
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) {
+    _controlHideTimer?.cancel();
+    _controlHideTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      try {
         final provider = context.read<VideoPlayerProvider>();
         if (provider.isPlaying) {
           setState(() => _showControls = false);
         }
+      } catch (_) {
+        // Timer callback fired during widget deactivation — safe to ignore.
+        // The element's internal widget reference is null even though
+        // mounted is true, so context.read<VideoPlayerProvider>() throws.
+        // This is harmless; controls just won't auto-hide this time.
       }
     });
   }

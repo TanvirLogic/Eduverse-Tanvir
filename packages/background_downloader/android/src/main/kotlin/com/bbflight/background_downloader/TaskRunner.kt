@@ -18,6 +18,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.DataOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -257,6 +259,14 @@ open class TaskRunner(
                     )
                 })
             }
+            // Native server callback after successful upload.
+            // The callback details (URL, auth token, JSON body) are stored in
+            // task.metaData by the Dart side at enqueue time.  Firing it here
+            // (from native Kotlin) ensures the server is notified even if the
+            // app is killed immediately after the S3 upload finishes.
+            if (modifiedStatus == TaskStatus.complete && task.isUploadTask()) {
+                processUploadCompleteCallback(task, context)
+            }
             // if task is in final state, cancel the WorkManager job (if failed),
             // remove task from persistent storage, clean up references to taskId
             // and invoke the onTaskFinishedCallback if necessary
@@ -400,6 +410,56 @@ open class TaskRunner(
             }
         }
 
+        /**
+         * Make the server callback HTTP POST after a successful upload.
+         *
+         * The callback details (URL, auth token, JSON body) are stored in the
+         * task's metaData field by the Dart side when the upload is enqueued.
+         * This ensures the server is notified even if the app is killed before
+         * the Dart callback handler fires.
+         *
+         * This is best-effort: if the callback fails, the Dart-side queue pump
+         * retry mechanism (via _loadQueue and _queuePump) will re-send it on
+         * next app start.
+         */
+        private suspend fun processUploadCompleteCallback(task: Task, context: Context) {
+            if (task.metaData.isEmpty() || !task.isUploadTask()) return
+            try {
+                val metaJson = Json.parseToJsonElement(task.metaData).jsonObject
+                val callbackUrl = metaJson["callbackUrl"]?.jsonPrimitive?.content ?: return
+                val authToken = metaJson["authToken"]?.jsonPrimitive?.content ?: return
+                val callbackBody = metaJson["callbackBody"]?.jsonPrimitive?.content ?: return
+                val idempotencyKey = metaJson["idempotencyKey"]?.jsonPrimitive?.content
+
+                Log.i(TAG, "Native server callback for taskId ${task.taskId}")
+
+                val url = URL(callbackUrl)
+                val connection = url.openConnection() as HttpURLConnection
+                try {
+                    connection.requestMethod = "POST"
+                    connection.setRequestProperty("Content-Type", "application/json")
+                    connection.setRequestProperty("Authorization", authToken)
+                    if (idempotencyKey != null) {
+                        connection.setRequestProperty("Idempotency-Key", idempotencyKey)
+                    }
+                    connection.doOutput = true
+                    connection.connectTimeout = 15000
+                    connection.readTimeout = 15000
+
+                    connection.outputStream.use { os ->
+                        os.write(callbackBody.toByteArray(Charsets.UTF_8))
+                        os.flush()
+                    }
+
+                    val responseCode = connection.responseCode
+                    Log.i(TAG, "Native callback response: HTTP $responseCode for taskId ${task.taskId}")
+                } finally {
+                    connection.disconnect()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Native callback failed for taskId ${task.taskId}: ${e.message}")
+            }
+        }
     }
 
     var task: Task

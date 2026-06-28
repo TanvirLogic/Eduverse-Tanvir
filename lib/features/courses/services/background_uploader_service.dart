@@ -12,17 +12,32 @@ class BackgroundUploaderService {
   /// Enqueue an upload to run in a native isolate via WorkManager.
   /// Survives app kills — returns the taskId for tracking.
   /// The itemId is stored in task.metaData so global callbacks can look it up.
+  /// If [callbackUrl], [authToken] and [callbackBody] are provided, they are
+  /// also stored in the metadata so native Kotlin code can fire the server
+  /// callback directly after the S3 upload completes — even if the app is killed.
+  /// [idempotencyKey] is passed to the native callback as an HTTP header so the
+  /// server can deduplicate requests when both native and Dart callbacks fire.
   static Future<String?> enqueueUpload({
     required int itemId,
     required String filePath,
     required String uploadUrl,
     required String contentType,
     String displayName = '',
+    String? callbackUrl,
+    String? authToken,
+    String? callbackBody,
+    String? idempotencyKey,
   }) async {
     if (displayName.isEmpty) {
       displayName = filePath.split(RegExp(r'[\\/]')).last;
     }
-    final metaData = jsonEncode({'itemId': itemId});
+    final metaData = jsonEncode({
+      'itemId': itemId,
+      if (callbackUrl != null) 'callbackUrl': callbackUrl,
+      if (authToken != null) 'authToken': authToken,
+      if (callbackBody != null) 'callbackBody': callbackBody,
+      if (idempotencyKey != null) 'idempotencyKey': idempotencyKey,
+    });
     final task = UploadTask.fromFile(
       file: File(filePath),
       url: uploadUrl,

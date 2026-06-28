@@ -59,8 +59,10 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
   }
 
   Future<void> _init() async {
-    // Register global callbacks so progress/status updates are received
-    // even if the app was killed and restarted while uploads were running.
+    // Register callbacks and notification config BEFORE start() so they
+    // are in place even if a task is enqueued before _init() completes.
+    // If a task starts without a notification config the native foreground
+    // service may fail (no notification = crash on Android 12+).
     FileDownloader().registerCallbacks(
       taskStatusCallback: (update) {
         unawaited(_onNativeTaskStatus(update));
@@ -69,17 +71,6 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         unawaited(_onNativeTaskProgress(update));
       },
     );
-
-    // Resume tracking of previously enqueued tasks and re-deliver
-    // any status/progress updates that fired while the app was suspended.
-    await FileDownloader().start(
-      doTrackTasks: true,
-      doRescheduleKilledTasks: true,
-    );
-
-    // Register native notification config for upload tasks.
-    // Shows a persistent notification with progress bar that survives
-    // app kill (native WorkManager continues showing/updating it).
     FileDownloader().configureNotificationForGroup(
       'upload_queue',
       running: TaskNotification(
@@ -95,6 +86,13 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         '{displayName} — tap to retry',
       ),
       progressBar: true,
+    );
+
+    // Resume tracking of previously enqueued tasks and re-deliver
+    // any status/progress updates that fired while the app was suspended.
+    await FileDownloader().start(
+      doTrackTasks: true,
+      doRescheduleKilledTasks: true,
     );
 
     // Give re-fired callbacks a moment to arrive before we inspect the queue.
@@ -117,40 +115,15 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     _queuePumpTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
       final all = await UploadQueueRepository.getActive();
       final now = DateTime.now();
-      bool recoveredAny = false;
-
-      // --- 1. Truly stale native tasks (>10 min in 'uploading') ---
-      // Skip items that have the native upload complete but are waiting
-      // for a server callback retry (e.g., auth token wasn't ready on
-      // restart). Those are handled by the callback retry check below.
-      for (final item in all) {
-        if (item.isNativeCompleted) continue;
-        final lastUpdatedParsed = DateTime.tryParse(item.lastUpdated);
-        if (item.status == 'uploading' &&
-            lastUpdatedParsed != null &&
-            now.difference(lastUpdatedParsed) > const Duration(minutes: 10)) {
-          AppLogger.w(
-            '_queuePump: resetting stale uploading item id=${item.id} '
-            '(lastUpdated=${item.lastUpdated})',
-          );
-          await UploadQueueRepository.resetStaleUploading();
-          recoveredAny = true;
-          break;
-        }
-      }
-      // refresh after mutation
-      if (recoveredAny) {
-        final refreshed = await UploadQueueRepository.getActive();
-        all
-          ..clear()
-          ..addAll(refreshed);
-      }
 
       // --- 1a. Proactive native-status check via background_downloader's
-      // internal DB. This catches uploads that reached 100% in the
-      // system tray but whose TaskStatus.complete callback didn't fire
-      // (same issue as the progress callback).  Without this the item
-      // would sit in 'uploading' for 10 minutes before getting reset.
+      // internal DB. This MUST run BEFORE the stale reset (section 1)
+      // to refresh timestamps for slow uploads.  Otherwise a multi-GB
+      // video whose Dart callbacks have stopped firing (app in
+      // background) would have a frozen lastUpdated —> section 1 resets
+      // it to 'pending' and clears workerId while the original native
+      // WorkManager task is still running, causing a second native
+      // upload to the same S3 key.
       {
         final refreshed = <UploadQueueItem>[];
         for (final item in all) {
@@ -173,12 +146,9 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
                 '— processing immediately',
               );
               unawaited(_handleNativeComplete(item.id!, item.workerId!));
-              continue; // skip adding to refreshed — will re-read on next pump
+              continue;
             }
             if (record == null) {
-              // Native task vanished (e.g. app was killed during upload).
-              // Reset to 'pending' so the queue can re-try immediately
-              // instead of being stuck in 'uploading' for 10 minutes.
               AppLogger.w(
                 '_queuePump: native task vanished for id=${item.id} '
                 '— resetting to pending',
@@ -191,7 +161,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
                 id: item.id!,
                 workerId: '',
               );
-              continue; // not added to refreshed
+              continue;
             }
             if (record.progress > 0 && item.fileSize > 0) {
               final nativeBytes = (record.progress * item.fileSize).round();
@@ -201,8 +171,8 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
                   bytesUploaded: nativeBytes,
                 );
               }
-              // Add to refreshed with fresh timestamp so section 1's stale
-              // check doesn't reset an actively uploading multi-GB item.
+              // Fresh timestamp prevents section 1 from resetting this
+              // slow upload while the native task is still running.
               refreshed.add(item.copyWith(
                 bytesUploaded: nativeBytes > item.bytesUploaded
                     ? nativeBytes
@@ -219,6 +189,32 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         all
           ..clear()
           ..addAll(refreshed);
+      }
+
+      // --- 1. Truly stale native tasks (>10 min in 'uploading') ---
+      {
+        bool recoveredAny = false;
+        for (final item in all) {
+          if (item.isNativeCompleted) continue;
+          final lastUpdatedParsed = DateTime.tryParse(item.lastUpdated);
+          if (item.status == 'uploading' &&
+              lastUpdatedParsed != null &&
+              now.difference(lastUpdatedParsed) > const Duration(minutes: 10)) {
+            AppLogger.w(
+              '_queuePump: resetting stale uploading item id=${item.id} '
+              '(lastUpdated=${item.lastUpdated})',
+            );
+            await UploadQueueRepository.resetStaleUploading();
+            recoveredAny = true;
+            break;
+          }
+        }
+        if (recoveredAny) {
+          final refreshed = await UploadQueueRepository.getActive();
+          all
+            ..clear()
+            ..addAll(refreshed);
+        }
       }
 
       // --- 1b. Retry server callback for items where native upload
@@ -305,13 +301,18 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
                 unawaited(_handleNativeComplete(item.id!, item.workerId!));
                 continue;
               }
-              if (record.status == TaskStatus.failed) {
+              if (record.status == TaskStatus.failed || record.status == TaskStatus.waitingToRetry) {
                 AppLogger.w(
-                  '_loadQueue: native upload failed for id=${item.id}',
+                  '_loadQueue: native upload ${record.status} for id=${item.id} '
+                  '— resetting to pending',
                 );
-                await UploadQueueRepository.markFailed(
-                  item.id!,
-                  'Native upload failed (recovered)',
+                await UploadQueueRepository.updateStatus(
+                  id: item.id!,
+                  status: 'pending',
+                );
+                await UploadQueueRepository.updateWorkerId(
+                  id: item.id!,
+                  workerId: '',
                 );
                 continue;
               }
@@ -392,20 +393,55 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
             );
           }
         }
-        // Remove items that never had any upload attempt (bytesUploaded == 0)
-        // and are too old to be relevant — they can never be enqueued without
-        // a fresh presigned URL. Items with bytesUploaded > 0 keep their
-        // progress so the UI can show the user where things stand.
+        // Items that were queued but app was killed before the presigned URL
+        // was stored. Instead of silently deleting them after 30 minutes,
+        // try to fetch fresh URLs. If that fails, mark as 'failed' so the
+        // user sees them and can manually retry or dismiss.
         if (item.status == 'pending' &&
             item.bytesUploaded == 0 &&
             (item.uploadUrl == null || item.uploadUrl!.isEmpty)) {
-          final age = DateTime.now().difference(DateTime.parse(item.createdAt));
-          if (age.inMinutes >= 30) {
+          // Skip items created within the last 30 seconds — addToQueue is
+          // likely still fetching the URL. Let _processNextItem handle it.
+          final created = DateTime.tryParse(item.createdAt);
+          if (created != null &&
+              DateTime.now().difference(created).inSeconds < 30) {
             AppLogger.i(
-              '_loadQueue: removing stale pending item id=${item.id} (no uploadUrl, age=${age.inMinutes}min)',
-              tag: 'UPLOAD-QUEUE',
+              '_loadQueue: pending item id=${item.id} is <30s old, '
+              'skipping URL fetch (addToQueue will handle)',
             );
-            await UploadQueueRepository.deleteItem(item.id!);
+            continue;
+          }
+          AppLogger.i(
+            '_loadQueue: pending item id=${item.id} has no uploadUrl '
+            '— attempting to fetch fresh URL',
+          );
+          try {
+            final freshUrls = await _fetchFreshUrls(item);
+            if (freshUrls != null) {
+              await UploadQueueRepository.updateUrls(
+                id: item.id!,
+                uploadUrl: freshUrls['uploadUrl']!,
+                fileUrl: freshUrls['fileUrl']!,
+              );
+              AppLogger.i(
+                '_loadQueue: restored URLs for item id=${item.id}',
+              );
+            } else {
+              AppLogger.w(
+                '_loadQueue: could not fetch fresh URL for item id=${item.id} '
+                '— marking as failed so user can retry',
+              );
+              await UploadQueueRepository.markFailed(
+                item.id!,
+                'Failed to get upload URL. Tap to retry.',
+              );
+            }
+          } catch (e) {
+            AppLogger.e('_loadQueue: error refreshing URL for item id=${item.id}: $e');
+            await UploadQueueRepository.markFailed(
+              item.id!,
+              'Failed to get upload URL. Tap to retry.',
+            );
           }
         }
       }
@@ -514,8 +550,8 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
   ///
   /// Sets [_isUploading] synchronously at entry to prevent race conditions
   /// across async gaps (callers may fire this concurrently).
-  Future<void> _processNextItem() async {
-    if (_isUploading) return;
+  Future<bool> _processNextItem() async {
+    if (_isUploading) return false;
     _isUploading = true;
     _isUploadingSince = DateTime.now();
 
@@ -526,7 +562,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       AppLogger.i('_processNextItem: native upload active, deferring FIFO');
       _isUploading = false;
       _isUploadingSince = null;
-      return;
+      return false;
     }
 
     UploadQueueItem? candidate;
@@ -537,7 +573,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         AppLogger.i('_processNextItem: no item to enqueue');
         _isUploading = false;
         _isUploadingSince = null;
-        return;
+        return false;
       }
 
       AppLogger.i('_processNextItem: claimed pending item id=${candidate.id}');
@@ -562,7 +598,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
             'Upload URL expired and could not be refreshed',
           );
           await _onItemTerminal(candidate.id!);
-          return;
+          return false;
         }
         await UploadQueueRepository.updateUrls(
           id: candidate.id!,
@@ -580,20 +616,36 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
 
       _activeItem ??= candidate;
       _activeProgress = 0;
-      // Keep the Dart isolate alive for reliable callback delivery
-      await UploadNotificationService.startService();
+      // background_downloader already runs as a foreground service
+      // (Config.runInForeground = Config.always), so no Dart-side
+      // background service is needed.
       await UploadQueueRepository.updateStatus(
         id: candidate.id!,
         status: 'uploading',
       );
       notifyListeners();
 
+      // Compute callback details for native execution after S3 upload.
+      // Stored in task.metaData so native Kotlin code fires the server
+      // callback directly — survives app kill.
+      final callbackDetails = _buildCallbackDetails(candidate);
+      final token = AuthController.accessToken;
+      final callbackBody = callbackDetails != null
+          ? jsonEncode(callbackDetails.body)
+          : null;
+
+      final idempotencyKey =
+          '${candidate.uploadId ?? candidate.id}_callback';
       final taskId = await BackgroundUploaderService.enqueueUpload(
         itemId: candidate.id!,
         filePath: candidate.filePath,
         uploadUrl: candidate.uploadUrl!,
         contentType: _resolveContentType(candidate),
         displayName: candidate.title,
+        callbackUrl: callbackDetails?.url,
+        authToken: token != null ? 'Bearer $token' : null,
+        callbackBody: callbackBody,
+        idempotencyKey: idempotencyKey,
       );
 
       if (taskId == null) {
@@ -605,7 +657,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
           'Failed to start native upload',
         );
         await _onItemTerminal(candidate.id!);
-        return;
+        return false;
       }
       AppLogger.i('_processNextItem: enqueued successfully, taskId=$taskId');
 
@@ -613,6 +665,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         id: candidate.id!,
         workerId: taskId,
       );
+      return true;
     } catch (e) {
       AppLogger.e('_processNextItem: exception: $e');
       _isUploading = false;
@@ -628,7 +681,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         );
         await _onItemTerminal(candidate.id!);
       }
-      return;
+      return false;
     }
   }
 
@@ -966,9 +1019,6 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     }
     _queue = await UploadQueueRepository.getActive();
     notifyListeners();
-    if (_queue.isEmpty) {
-      await UploadNotificationService.stopService();
-    }
     _processNextItem();
   }
 
@@ -1004,9 +1054,9 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
 
       final insertResult = await UploadQueueRepository.insert(item);
       final id = insertResult['id'] as int;
-      _queue = await UploadQueueRepository.getActive();
-      notifyListeners();
 
+      // Fetch URL FIRST, then notify (avoids _loadQueue seeing a
+      // URL-less pending item and racing a duplicate URL fetch).
       final urls = await BackgroundUploadService.fetchPresignedUrl(
         filePath: file.path,
         endpoint: Urls.videoPostAssetsUploadUrl,
@@ -1025,7 +1075,23 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         uploadUrl: urls['uploadUrl']!,
         fileUrl: urls['fileUrl']!,
       );
-      _processNextItem();
+      // Now safe to expose item to listeners (URL is set on DB row).
+      _queue = await UploadQueueRepository.getActive();
+      notifyListeners();
+
+      if (_isUploading) {
+        // Another upload is active (native FIFO lock).  The item was
+        // inserted with a valid URL and will start when the current
+        // upload finishes — no need to call _processNextItem.
+        ToastService.showSuccess('Video queued for upload');
+        return true;
+      }
+
+      final enqueued = await _processNextItem();
+      if (!enqueued) {
+        ToastService.showError('Failed to start upload. Please try again.');
+        return false;
+      }
       ToastService.showSuccess('Video queued for upload');
       return true;
     } catch (e) {
@@ -1132,7 +1198,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     );
 
     ToastService.showSuccess('Course upload queued');
-    _processNextItem();
+    await _processNextItem();
     return id;
   }
 
@@ -1194,7 +1260,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       );
 
       ToastService.showSuccess('Intro video queued');
-      _processNextItem();
+      await _processNextItem();
       return videoFileUrl;
     } catch (e) {
       AppLogger.e('addCourseIntroVideo error: $e');
@@ -1265,7 +1331,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       }
 
       _queue = await UploadQueueRepository.getActive();
-      _processNextItem();
+      await _processNextItem();
       ToastService.showSuccess('Assets queued for upload');
 
       return {
@@ -1431,7 +1497,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     );
 
     ToastService.showSuccess('Your Resource is being uploaded');
-    _processNextItem();
+    await _processNextItem();
     return id;
   }
 
