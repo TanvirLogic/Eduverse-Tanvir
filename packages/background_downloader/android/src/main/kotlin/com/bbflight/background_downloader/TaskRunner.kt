@@ -259,14 +259,15 @@ open class TaskRunner(
                     )
                 })
             }
-            // Native server callback after successful upload.
-            // The callback details (URL, auth token, JSON body) are stored in
-            // task.metaData by the Dart side at enqueue time.  Firing it here
-            // (from native Kotlin) ensures the server is notified even if the
-            // app is killed immediately after the S3 upload finishes.
-            if (modifiedStatus == TaskStatus.complete && task.isUploadTask()) {
-                processUploadCompleteCallback(task, context)
-            }
+            // Server callback is handled entirely on the Dart side
+            // (_handleNativeComplete -> _sendCallbackForItem) to avoid
+            // duplicate server records. The Dart queue pump retries any
+            // failed callbacks on app restart via _loadQueue + _queuePump
+            // (checks isNativeCompleted && !isCallbackCompleted).
+            // Native callback removed: dual-callback race caused the server
+            // to receive two identical POST requests. The Idempotency-Key
+            // header is supposed to dedup, but not all servers enforce it.
+            // Dart-side retry is sufficient for surviving app kills.
             // if task is in final state, cancel the WorkManager job (if failed),
             // remove task from persistent storage, clean up references to taskId
             // and invoke the onTaskFinishedCallback if necessary

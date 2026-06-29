@@ -8,7 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 String _generateUploadId() {
-  final now = DateTime.now().millisecondsSinceEpoch;
+  final now = DateTime.now().microsecondsSinceEpoch;
   final rand = Random().nextInt(0x7FFFFFFF);
   return 'up_${now}_$rand';
 }
@@ -194,7 +194,9 @@ class UploadQueueRepository {
     try {
       final db = await database;
       await db.rawQuery('PRAGMA wal_checkpoint(TRUNCATE)');
-    } catch (_) {}
+    } catch (e) {
+      AppLogger.w('checkpointWal: $e');
+    }
   }
 
   static Future<Database> _initDb() async {
@@ -531,14 +533,15 @@ class UploadQueueRepository {
     required int bytesUploaded,
   }) async {
     final db = await database;
+    // Prevent out-of-order progress updates from moving the bar backward.
     await db.update(
       'upload_queue',
       {
         'bytesUploaded': bytesUploaded,
         'lastUpdated': DateTime.now().toIso8601String(),
       },
-      where: 'id = ?',
-      whereArgs: [id],
+      where: 'id = ? AND bytesUploaded < ?',
+      whereArgs: [id, bytesUploaded],
     );
   }
 
@@ -668,8 +671,10 @@ class UploadQueueRepository {
   static Future<void> _reclaimSpace() async {
     try {
       final db = await database;
-      await db.rawQuery('PRAGMA incremental_vacuum(0)');
-    } catch (_) {}
+      await db.rawQuery('PRAGMA incremental_vacuum');
+    } catch (e) {
+      AppLogger.w('_reclaimSpace: $e');
+    }
   }
 
   static Future<int> countPending() async {

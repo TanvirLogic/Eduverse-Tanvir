@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:edtech/global/core/services/logger_service.dart';
 import 'package:edtech/global/core/services/video_progress_service.dart';
 import 'package:edtech/global/core/services/course_progress_service.dart';
 import 'package:edtech/app/setup_network_caller.dart';
@@ -82,6 +83,11 @@ class VideoPlayerProvider extends ChangeNotifier {
     String? nextVideoUrl,
     String? nextVideoTitle,
   }) async {
+    if (url.isEmpty) {
+      hasError = true;
+      notifyListeners();
+      return;
+    }
     currentVideoUrl = url;
     currentTitle = title;
     currentLessonId = lessonId;
@@ -109,7 +115,8 @@ class VideoPlayerProvider extends ChangeNotifier {
       }
       _player.play();
       _startAutoSave();
-    } catch (_) {
+    } catch (e) {
+      AppLogger.e('openVideo error: $e');
       hasError = true;
       notifyListeners();
     }
@@ -213,6 +220,7 @@ class VideoPlayerProvider extends ChangeNotifier {
 
   void stop() {
     _saveTimer?.cancel();
+    if (!isActive) return;
     _player.stop();
     isActive = false;
     isInitialized = false;
@@ -228,6 +236,7 @@ class VideoPlayerProvider extends ChangeNotifier {
 
   void dismiss() {
     _saveTimer?.cancel();
+    if (!isActive) return;
     _player.stop();
     isActive = false;
     isInitialized = false;

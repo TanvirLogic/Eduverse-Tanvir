@@ -16,6 +16,7 @@ import 'package:edtech/global/core/services/logger_service.dart';
 import 'package:edtech/global/core/services/toast_service.dart';
 import 'package:edtech/global/core/services/upload_notification_service.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 
 class UnifiedUploadQueueProvider extends ChangeNotifier {
   List<UploadQueueItem> _queue = [];
@@ -558,7 +559,10 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     // Preserve FIFO: if a native upload is already running (from before
     // app restart), don't start the next pending item yet.
     final existing = await UploadQueueRepository.getActive();
-    if (existing.any((i) => i.status == 'uploading' && i.workerId != null && i.workerId!.isNotEmpty)) {
+    // Items where native upload completed but callback is pending
+    // (isNativeCompleted=true) should not block FIFO — the queue pump
+    // will retry the callback. Skip them so the next item can start.
+    if (existing.any((i) => i.status == 'uploading' && i.workerId != null && i.workerId!.isNotEmpty && !i.isNativeCompleted)) {
       AppLogger.i('_processNextItem: native upload active, deferring FIFO');
       _isUploading = false;
       _isUploadingSince = null;
@@ -612,6 +616,22 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         );
         _activeItem = candidate;
         AppLogger.i('_processNextItem: URL refreshed for id=${candidate.id}');
+      }
+
+      // Safety net: confirm the source file still exists on disk.
+      // The file may have been in Android's cache dir and was cleaned
+      // while the item was waiting in the queue.
+      if (!File(candidate.filePath).existsSync()) {
+        AppLogger.e(
+          '_processNextItem: source file missing for id=${candidate.id} '
+          '— ${candidate.filePath}',
+        );
+        await UploadQueueRepository.markFailed(
+          candidate.id!,
+          'Upload file no longer exists on device',
+        );
+        await _onItemTerminal(candidate.id!);
+        return false;
       }
 
       _activeItem ??= candidate;
@@ -745,6 +765,15 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
           'thumbnailContentType': 'image/jpeg',
           'videoFilename': name,
           'videoContentType': BackgroundUploadService.inferVideoContentType(
+            name,
+          ),
+        };
+        break;
+      case 'course_thumb':
+        endpoint = Urls.courseAssetsUploadUrl;
+        buildPayload = (name) => {
+          'thumbnailFilename': name,
+          'thumbnailContentType': BackgroundUploadService.inferImageContentType(
             name,
           ),
         };
@@ -993,6 +1022,12 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
           body: {'title': item.title, 'videoUrl': item.fileUrl},
         );
 
+      case 'course_thumb':
+        return _CallbackDetails(
+          url: Urls.courseAssetsUploadUrl,
+          body: {'thumbnailUrl': item.fileUrl},
+        );
+
       default:
         // video_post
         return _CallbackDetails(
@@ -1029,13 +1064,18 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
   /// Video post: queue → fetch presigned URL → start upload.
   Future<bool> addToQueue(File file, String title) async {
     try {
-      if (await _hasInFlightFile(file.path)) {
+      // Persist before anything else: copy from image_picker's temp
+      // cache dir to a permanent location so Android cache cleanup
+      // can't delete it while the item waits in the queue.
+      final persistentPath = await _persistFileIfNeeded(file.path);
+
+      if (await _hasInFlightFile(persistentPath)) {
         ToastService.showError('This file is already being uploaded');
         return false;
       }
 
-      final duration = await VideoMetadataHelper.getDurationSeconds(file.path);
-      final fileSize = await VideoMetadataHelper.getFileSizeBytes(file.path);
+      final duration = await VideoMetadataHelper.getDurationSeconds(persistentPath);
+      final fileSize = await VideoMetadataHelper.getFileSizeBytes(persistentPath);
 
       final permission = await _ensureNotificationPermission();
       if (!permission) {
@@ -1044,7 +1084,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       }
 
       final item = UploadQueueItem(
-        filePath: file.path,
+        filePath: persistentPath,
         title: title,
         videoDuration: duration,
         fileSize: fileSize,
@@ -1058,7 +1098,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       // Fetch URL FIRST, then notify (avoids _loadQueue seeing a
       // URL-less pending item and racing a duplicate URL fetch).
       final urls = await BackgroundUploadService.fetchPresignedUrl(
-        filePath: file.path,
+        filePath: persistentPath,
         endpoint: Urls.videoPostAssetsUploadUrl,
         buildPayload: (name) => {
           'videoFilename': name,
@@ -1066,7 +1106,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         },
       );
       if (urls == null) {
-        await _cleanupFailedUpload(id, file.path);
+        await _cleanupFailedUpload(id, persistentPath);
         ToastService.showError('Failed to get upload URL');
         return false;
       }
@@ -1079,18 +1119,22 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       _queue = await UploadQueueRepository.getActive();
       notifyListeners();
 
-      if (_isUploading) {
-        // Another upload is active (native FIFO lock).  The item was
-        // inserted with a valid URL and will start when the current
-        // upload finishes — no need to call _processNextItem.
+      // Check both the Dart lock and the native FIFO lock.  If either is
+      // active the item will start when the current upload finishes.
+      final hasActiveNative = (await UploadQueueRepository.getActive())
+          .any((i) => i.status == 'uploading' && i.workerId != null && i.workerId!.isNotEmpty && !i.isNativeCompleted);
+
+      if (_isUploading || hasActiveNative) {
         ToastService.showSuccess('Video queued for upload');
         return true;
       }
 
       final enqueued = await _processNextItem();
       if (!enqueued) {
-        ToastService.showError('Failed to start upload. Please try again.');
-        return false;
+        // The item IS in the DB with a valid URL. It will start on the
+        // next queue-pump cycle, so treat this as queued, not failed.
+        ToastService.showSuccess('Video queued for upload');
+        return true;
       }
       ToastService.showSuccess('Video queued for upload');
       return true;
@@ -1114,6 +1158,11 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     required double price,
     String? introVideoUrl,
   }) async {
+    final persThumbnailPath = await _persistFileIfNeeded(thumbnailPath);
+    final persVideoPath = videoPath != null
+        ? await _persistFileIfNeeded(videoPath)
+        : null;
+
     final meta = CourseUploadMetadata(
       courseTitle: title,
       shortDescription: shortDescription,
@@ -1123,11 +1172,11 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       level: level,
       type: type,
       price: price,
-      videoPath: introVideoUrl != null ? null : videoPath,
+      videoPath: introVideoUrl != null ? null : persVideoPath,
     );
 
     final metadataJson = jsonEncode(meta.toJson());
-    final thumbFile = File(thumbnailPath);
+    final thumbFile = File(persThumbnailPath);
     final thumbSize = await thumbFile.length();
 
     final permission = await _ensureNotificationPermission();
@@ -1137,7 +1186,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     }
 
     final item = UploadQueueItem(
-      filePath: thumbnailPath,
+      filePath: persThumbnailPath,
       title: 'Course: $title',
       fileSize: thumbSize,
       status: 'pending',
@@ -1151,15 +1200,15 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     notifyListeners();
 
     final bool externalIntro = introVideoUrl != null;
-    final String? effectiveVideoPath = externalIntro ? null : videoPath;
+    final String? effectiveVideoPath = externalIntro ? null : persVideoPath;
 
     final urls = await BackgroundUploadService.fetchCoursePresignedUrls(
-      thumbnailPath: thumbnailPath,
+      thumbnailPath: persThumbnailPath,
       videoPath: effectiveVideoPath,
     );
 
     if (urls == null) {
-      await _cleanupFailedUpload(id, thumbnailPath);
+      await _cleanupFailedUpload(id, persThumbnailPath);
       ToastService.showError('Failed to get upload URLs');
       return 0;
     }
@@ -1167,14 +1216,14 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     final thumbnailUploadUrl = urls['thumbnailUploadUrl']!;
     final thumbnailFileUrl = urls['thumbnailFileUrl']!;
 
-    if (!externalIntro && videoPath != null) {
+    if (!externalIntro && persVideoPath != null) {
       final videoUploadUrl = urls['videoUploadUrl'];
       final videoFileUrl = urls['videoFileUrl'];
       if (videoUploadUrl != null && videoFileUrl != null) {
         final videoItem = UploadQueueItem(
-          filePath: videoPath,
+          filePath: persVideoPath,
           title: 'Course intro video: $title',
-          fileSize: await File(videoPath).length(),
+          fileSize: await File(persVideoPath).length(),
           status: 'pending',
           uploadType: 'course_intro',
           metadata: metadataJson,
@@ -1207,12 +1256,14 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     required String title,
   }) async {
     try {
-      if (await _hasInFlightFile(filePath)) {
+      final persistentPath = await _persistFileIfNeeded(filePath);
+
+      if (await _hasInFlightFile(persistentPath)) {
         ToastService.showError('This video is already queued');
         return null;
       }
 
-      final file = File(filePath);
+      final file = File(persistentPath);
       final fileSize = await file.length();
 
       final permission = await _ensureNotificationPermission();
@@ -1222,7 +1273,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       }
 
       final item = UploadQueueItem(
-        filePath: filePath,
+        filePath: persistentPath,
         title: title,
         fileSize: fileSize,
         status: 'pending',
@@ -1235,12 +1286,12 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       notifyListeners();
 
       final urls = await BackgroundUploadService.fetchCoursePresignedUrls(
-        thumbnailPath: filePath,
-        videoPath: filePath,
+        thumbnailPath: persistentPath,
+        videoPath: persistentPath,
       );
 
       if (urls == null) {
-        await _cleanupFailedUpload(id, filePath);
+        await _cleanupFailedUpload(id, persistentPath);
         ToastService.showError('Failed to get upload URL');
         return null;
       }
@@ -1248,7 +1299,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       final videoUploadUrl = urls['videoUploadUrl'];
       final videoFileUrl = urls['videoFileUrl'];
       if (videoUploadUrl == null || videoFileUrl == null) {
-        await _cleanupFailedUpload(id, filePath);
+        await _cleanupFailedUpload(id, persistentPath);
         ToastService.showError('Server did not provide a video upload URL');
         return null;
       }
@@ -1278,9 +1329,16 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     if (thumbnailPath == null && videoPath == null) return {};
 
     try {
+      final persThumbnailPath = thumbnailPath != null
+          ? await _persistFileIfNeeded(thumbnailPath)
+          : null;
+      final persVideoPath = videoPath != null
+          ? await _persistFileIfNeeded(videoPath)
+          : null;
+
       final urls = await BackgroundUploadService.fetchCoursePresignedUrls(
-        thumbnailPath: thumbnailPath ?? videoPath!,
-        videoPath: videoPath,
+        thumbnailPath: persThumbnailPath ?? persVideoPath!,
+        videoPath: persVideoPath,
       );
 
       if (urls == null) {
@@ -1288,14 +1346,14 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         return null;
       }
 
-      if (thumbnailPath != null) {
+      if (persThumbnailPath != null) {
         final thumbUploadUrl = urls['thumbnailUploadUrl'];
         final thumbFileUrl = urls['thumbnailFileUrl'];
         if (thumbUploadUrl != null && thumbFileUrl != null) {
           final item = UploadQueueItem(
-            filePath: thumbnailPath,
+            filePath: persThumbnailPath,
             title: 'Course thumbnail: $courseTitle',
-            fileSize: await File(thumbnailPath).length(),
+            fileSize: await File(persThumbnailPath).length(),
             status: 'pending',
             uploadType: 'course_thumb',
           );
@@ -1309,14 +1367,14 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
         }
       }
 
-      if (videoPath != null) {
+      if (persVideoPath != null) {
         final videoUploadUrl = urls['videoUploadUrl'];
         final videoFileUrl = urls['videoFileUrl'];
         if (videoUploadUrl != null && videoFileUrl != null) {
           final item = UploadQueueItem(
-            filePath: videoPath,
+            filePath: persVideoPath,
             title: 'Course intro: $courseTitle',
-            fileSize: await File(videoPath).length(),
+            fileSize: await File(persVideoPath).length(),
             status: 'pending',
             uploadType: 'course_intro',
           );
@@ -1359,8 +1417,10 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       return 0;
     }
 
-    if (await _hasInFlightFile(videoPath, uploadType: 'module_lesson')) {
-      AppLogger.w('addModuleLessonToQueue: file already queued at $videoPath');
+    final persistentPath = await _persistFileIfNeeded(videoPath);
+
+    if (await _hasInFlightFile(persistentPath, uploadType: 'module_lesson')) {
+      AppLogger.w('addModuleLessonToQueue: file already queued at $persistentPath');
       ToastService.showError('This video is already in the upload queue');
       return 0;
     }
@@ -1379,12 +1439,12 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     );
 
     final metadataJson = jsonEncode(meta.toJson());
-    final videoFile = File(videoPath);
+    final videoFile = File(persistentPath);
     final fileSize = await videoFile.length();
-    final duration = await VideoMetadataHelper.getDurationSeconds(videoPath);
+    final duration = await VideoMetadataHelper.getDurationSeconds(persistentPath);
 
     final item = UploadQueueItem(
-      filePath: videoPath,
+      filePath: persistentPath,
       title: lessonTitle,
       videoDuration: duration,
       fileSize: fileSize,
@@ -1399,7 +1459,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     notifyListeners();
 
     final urls = await BackgroundUploadService.fetchPresignedUrl(
-      filePath: videoPath,
+      filePath: persistentPath,
       endpoint: Urls.courseModuleUploadUrl,
       buildPayload: (name) => {
         'videoFilename': name,
@@ -1409,7 +1469,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     );
 
     if (urls == null) {
-      await _cleanupFailedUpload(id, videoPath);
+      await _cleanupFailedUpload(id, persistentPath);
       ToastService.showError('Failed to get upload URL');
       return 0;
     }
@@ -1440,8 +1500,10 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       return 0;
     }
 
-    if (await _hasInFlightFile(filePath, uploadType: 'resource')) {
-      AppLogger.w('addResourceToQueue: file already queued at $filePath');
+    final persistentPath = await _persistFileIfNeeded(filePath);
+
+    if (await _hasInFlightFile(persistentPath, uploadType: 'resource')) {
+      AppLogger.w('addResourceToQueue: file already queued at $persistentPath');
       ToastService.showError('This resource is already in the upload');
       return 0;
     }
@@ -1461,11 +1523,11 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     );
 
     final metadataJson = jsonEncode(meta.toJson());
-    final resourceFile = File(filePath);
+    final resourceFile = File(persistentPath);
     final fileSize = await resourceFile.length();
 
     final item = UploadQueueItem(
-      filePath: filePath,
+      filePath: persistentPath,
       title: lessonTitle,
       fileSize: fileSize,
       status: 'pending',
@@ -1479,13 +1541,13 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     notifyListeners();
 
     final urls = await BackgroundUploadService.fetchPresignedUrl(
-      filePath: filePath,
+      filePath: persistentPath,
       endpoint: Urls.courseModuleResourceUploadUrl,
       buildPayload: (name) => {'filename': name, 'contentType': contentType},
     );
 
     if (urls == null) {
-      await _cleanupFailedUpload(id, filePath);
+      await _cleanupFailedUpload(id, persistentPath);
       ToastService.showError('Failed to get upload URL');
       return 0;
     }
@@ -1512,6 +1574,32 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Copies [filePath] from a temp/cache directory into
+  /// `getApplicationDocumentsDirectory()/eduverse_uploads/` so Android
+  /// cache cleanup can't delete it before the upload starts.
+  /// Returns the persistent path (or the original if already persistent).
+  Future<String> _persistFileIfNeeded(String filePath) async {
+    final file = File(filePath);
+    if (!file.existsSync()) {
+      AppLogger.e('_persistFileIfNeeded: file not found at $filePath');
+      return filePath;
+    }
+    final tempDir = await getTemporaryDirectory();
+    // On Android getTemporaryDirectory() returns getCacheDir():
+    //   /data/user/0/<pkg>/cache/
+    // If the file is already outside cache, keep it in place.
+    if (!filePath.startsWith(tempDir.path)) return filePath;
+    final docsDir = await getApplicationDocumentsDirectory();
+    final uploadsDir = Directory('${docsDir.path}/eduverse_uploads');
+    if (!uploadsDir.existsSync()) {
+      uploadsDir.createSync(recursive: true);
+    }
+    final baseName = filePath.split(RegExp(r'[\\/]')).last;
+    final newPath = '${uploadsDir.path}/${DateTime.now().millisecondsSinceEpoch}_$baseName';
+    await file.copy(newPath);
+    AppLogger.i('_persistFileIfNeeded: copied $filePath → $newPath');
+    return newPath;
+  }
 
 
   // ──────────────────────────────────────────────
@@ -1553,6 +1641,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
   }
 
   Future<void> _openNotificationSettings() async {
+    if (!Platform.isAndroid) return;
     final exec = Platform.resolvedExecutable;
     final segments = exec.split('/');
     String? packageName;
@@ -1649,6 +1738,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       _isUploadingSince = null;
     }
     notifyListeners();
+    _processNextItem();
   }
 
   Future<void> clearCompleted() async {
@@ -1706,12 +1796,12 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
   /// Legacy handler from simpler upload flow.
   /// Prefers the callback-based path via [_onNativeTaskStatus].
   /// Still releases the queue lock if this was the active item.
-  void onNativeUploadCompleted(int id, String fileUrl) {
-    UploadQueueRepository.markCompleted(id);
+  Future<void> onNativeUploadCompleted(int id, String fileUrl) async {
+    await UploadQueueRepository.markCompleted(id);
     final idx = _queue.indexWhere((item) => item.id == id);
     if (idx >= 0) {
       _queue[idx] = _queue[idx].copyWith(status: 'completed', fileUrl: fileUrl);
-      _cleanupCachedFile(_queue[idx].filePath);
+      await _cleanupCachedFile(_queue[idx].filePath);
     }
     if (_activeItem?.id == id) {
       _activeItem = null;
@@ -1721,6 +1811,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
     }
     notifyListeners();
     ToastService.showSuccess('Upload completed');
+    await _processNextItem();
   }
 
   Future<void> _cleanupCachedFile(String filePath) async {
@@ -1729,8 +1820,8 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
 
   /// Legacy handler from simpler upload flow.
   /// Releases the queue lock if this was the active item.
-  void onNativeUploadFailed(int id, String error) {
-    UploadQueueRepository.markFailed(id, error);
+  Future<void> onNativeUploadFailed(int id, String error) async {
+    await UploadQueueRepository.markFailed(id, error);
     final idx = _queue.indexWhere((item) => item.id == id);
     if (idx >= 0) {
       _queue[idx] = _queue[idx].copyWith(status: 'failed', errorMessage: error);
@@ -1740,6 +1831,7 @@ class UnifiedUploadQueueProvider extends ChangeNotifier {
       _isUploadingSince = null;
     }
     notifyListeners();
+    await _processNextItem();
   }
 }
 

@@ -5,6 +5,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:provider/provider.dart';
 import 'package:edtech/app/app_colors.dart';
 import 'package:edtech/global/core/providers/video_player_provider.dart';
+import 'package:edtech/global/core/services/logger_service.dart';
 
 class VideoPlayerScreen extends StatefulWidget {
   final String videoUrl;
@@ -42,14 +43,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
         _enterFullScreen();
         final provider = context.read<VideoPlayerProvider>();
 
         final sameVideo = provider.currentVideoUrl == widget.videoUrl;
         if (!sameVideo || !provider.isActive) {
-          provider.openVideo(
+          await provider.openVideo(
             url: widget.videoUrl,
             title: widget.title,
             initialPosition: widget.initialPosition,
@@ -68,25 +69,29 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             provider.play();
           }
         }
-      } catch (_) {
-        // Silently recover — video screen will show error state via provider.hasError
+      } catch (e) {
+        AppLogger.e('VideoPlayerScreen init: $e');
       }
     });
   }
 
   void _handleAutoPlayNext() {
     if (!_autoPlayNext || widget.nextVideoUrl == null) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(
-        builder: (_) => VideoPlayerScreen(
-          videoUrl: widget.nextVideoUrl!,
-          title: widget.nextVideoTitle ?? '',
-          lessonId: widget.lessonId,
-          courseId: widget.courseId,
-          onCompleted: widget.onCompleted,
+    try {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => VideoPlayerScreen(
+            videoUrl: widget.nextVideoUrl!,
+            title: widget.nextVideoTitle ?? '',
+            lessonId: widget.lessonId,
+            courseId: widget.courseId,
+            onCompleted: widget.onCompleted,
+          ),
         ),
-      ),
-    );
+      );
+    } catch (e) {
+      AppLogger.e('_handleAutoPlayNext: $e');
+    }
   }
 
   // void _toggleAutoPlayNext() {
@@ -94,25 +99,31 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   // }
 
   void _enterFullScreen() {
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    try {
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } catch (_) {}
   }
 
   void _exitFullScreen() {
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    try {
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ]);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    } catch (_) {}
   }
 
   @override
   void dispose() {
     _controlHideTimer?.cancel();
-    context.read<VideoPlayerProvider>().pause();
+    try {
+      context.read<VideoPlayerProvider>().pause();
+    } catch (_) {}
     _exitFullScreen();
     super.dispose();
   }

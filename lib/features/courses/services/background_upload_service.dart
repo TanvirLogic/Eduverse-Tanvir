@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -77,6 +78,11 @@ class BackgroundUploadService {
         }
       } on http.ClientException {
         AppLogger.w('fetchPresignedUrl: ClientException on attempt ${retry + 1}');
+        if (retry < maxRetries - 1) {
+          await Future.delayed(Duration(seconds: 2 * (retry + 1)));
+        }
+      } on TimeoutException {
+        AppLogger.w('fetchPresignedUrl: timeout on attempt ${retry + 1}');
         if (retry < maxRetries - 1) {
           await Future.delayed(Duration(seconds: 2 * (retry + 1)));
         }
@@ -194,6 +200,11 @@ class BackgroundUploadService {
         await Future.delayed(Duration(seconds: 2 * (retry + 1)));
       } on http.ClientException {
         await Future.delayed(Duration(seconds: 2 * (retry + 1)));
+      } on TimeoutException {
+        AppLogger.w('fetchCoursePresignedUrls: timeout on attempt ${retry + 1}');
+        if (retry < maxRetries - 1) {
+          await Future.delayed(Duration(seconds: 2 * (retry + 1)));
+        }
       }
     }
     AppLogger.e('fetchCoursePresignedUrls: failed after $maxRetries retries');

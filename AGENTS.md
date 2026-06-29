@@ -1,24 +1,38 @@
 # Session Summary — Jun 29, 2026
 
 ## Goal
-Fix video upload reliability based on device log analysis.
+Fix video upload reliability to perform like YouTube — background, foreground, app killed, large/small files, queue processing.
 
 ## Completed
 
-### Log analysis (`full_log.txt`) — Queue state at app restart
-- **Item id=1** (`video_post`, title="Ibibs"): `status=uploading`, native record `TaskStatus.running` progress=0%. `_loadQueue` correctly claims the FIFO lock.
-- **Item id=2** (`video_post`, title="meojdbudd"): `status=pending`, waiting for item 1 to finish.
-- **Item id=3** (`video_post`, title="brbrnfn"): inserted by `addToQueue`, got presigned URL (201). But `_processNextItem()` returned `false` because `_isUploading=true`.
+### Log analysis — full picture
+- Traced end-to-end flow from `addToQueue` → SQLite → `_processNextItem` → native `TaskRunner` → completion callback → server callback → queue advance
+- Identified root cause of missing upload: file stored in Android cache dir was deleted before upload started
 
-### Bug fixed: `addToQueue` shows false error when another upload is active
-- **File**: `unified_upload_queue_provider.dart:1082-1088`
-- **Before**: Called `_processNextItem()` unconditionally. When it returned `false` (FIFO lock from native upload), showed `"Failed to start upload. Please try again."` and returned `false`. The caller (`upload_video_screen.dart`) did NOT pop navigation, leaving the user on the upload screen with a scary error — even though the item WAS inserted with a valid URL.
-- **After**: Checks `_isUploading` before calling `_processNextItem()`. If already uploading, shows `"Video queued for upload"` and returns `true`. The item is in the DB and will start when the current upload finishes.
-- **Consistency**: All other add methods (`addCourseToQueue`, `addModuleLessonToQueue`, `addResourceToQueue`, `addCourseIntroVideo`, `queueCourseEditAssets`) already don't check `_processNextItem`'s return value — they show "queued" regardless. Only `addToQueue` was broken.
+### Bug fixes applied
 
-### Items NOT bugs (after analysis)
-1. **WorkManager re-enqueue loop**: The same WorkSpec moved to foreground 3× within 2s. Investigated — this is Android 12+ foreground service heartbeat, not a bug.
-2. **Item id=2 stuck without URL**: `_loadQueue` already handles URL-less pending items by fetching fresh URLs or marking as failed. Item 2 likely has a URL; it's simply waiting for item 1 to finish.
+| # | Bug | File | Fix |
+|---|-----|------|-----|
+| 1 | **Source file deleted from Android cache** before upload starts | `unified_upload_queue_provider.dart` | Added `_persistFileIfNeeded()` copies from cache → `getApplicationDocumentsDirectory()/eduverse_uploads/` in all 6 add methods |
+| 2 | **`addToQueue` shows false error** when another upload is active | `unified_upload_queue_provider.dart:1104-1112` | Checks DB for native active upload in addition to `_isUploading`; `_processNextItem` false return now shows "queued" not "failed" |
+| 3 | **FIFO deadlock when server callback fails** — native upload done but callback pending, `_processNextItem` refuses to advance | `unified_upload_queue_provider.dart:562` | `_processNextItem` FIFO check now skips items with `isNativeCompleted=true` so next pending item can start |
+| 4 | **`onNativeUploadFailed` doesn't start next item** — queue stuck until pump cycle | `unified_upload_queue_provider.dart:1798` | Converted to `Future<void>`, awaits DB writes, calls `_processNextItem()` |
+| 5 | **`onNativeUploadCompleted` drops DB writes** — fire-and-forget `markCompleted` | `unified_upload_queue_provider.dart:1775` | Converted to `Future<void>`, awaits DB writes, calls `_processNextItem()` |
+| 6 | **`removeItem` doesn't advance queue** — next item waits 15s for pump | `unified_upload_queue_provider.dart:1703` | Added `_processNextItem()` call |
+| 7 | **`course_thumb` type has no callback** — falls through to `video_post` default, creates wrong server record | `unified_upload_queue_provider.dart:1007, 758` | Added `'course_thumb'` case to both `_buildCallbackDetails` and `_fetchFreshUrls` |
+| 8 | **`_generateUploadId` collision** — two items in same millisecond with same `Random()` seed get duplicate `uploadId` | `upload_queue_repository.dart:10-14` | Changed to `microsecondsSinceEpoch` (1000× finer granularity) |
+| 9 | **`updateProgress` moves bar backward** — out-of-order callbacks | `upload_queue_repository.dart:529` | Added `WHERE bytesUploaded < ?` monotonicity guard |
+| 10 | **`_openNotificationSettings` crashes on iOS** — `Process.run('am', ...)` only exists on Android | `unified_upload_queue_provider.dart:1621` | Added `if (!Platform.isAndroid) return;` |
+| 11 | **`TimeoutException` not caught** in URL fetch — bypasses retry loop | `background_upload_service.dart:83,202` | Added `on TimeoutException` catch clause to both `fetchPresignedUrl` and `fetchCoursePresignedUrls` |
+| 12 | **`PRAGMA incremental_vacuum(0)` is a no-op** | `upload_queue_repository.dart:671` | Changed to `PRAGMA incremental_vacuum` |
+| 13 | **Silent errors swallowed** in `_reclaimSpace` and `checkpointWal` | `upload_queue_repository.dart` | Added `AppLogger.w()` to catch blocks |
+| 14 | **VideoPlayerScreen.initState async crash** — un-awaited Futures can throw unhandled | `video_player_screen.dart:45` | Properly await calls, log errors instead of silent `catch(_)` |
+| 15 | **VideoPlayerScreen.dispose() crash** — `context.read()` can throw if provider is gone | `video_player_screen.dart:115` | Guard with try-catch |
+| 16 | **VideoPlayerProvider.double-stop crash** — `_player.stop()` on already-stopped player | `video_player_provider.dart:214,229` | Add `isActive` guard to `stop()` and `dismiss()` |
+| 17 | **VideoPlayerProvider.openVideo empty URL** — unguarded `_player.open(Media(""))` can crash native | `video_player_provider.dart:100` | Early return with `hasError=true` |
+| 18 | **VideoPlayerScreen auto-advance crash** — `Navigator.pushReplacement` with stale context | `video_player_screen.dart:82` | Guard with try-catch |
+| 19 | **SystemChrome crash** — `_enterFullScreen`/`_exitFullScreen` throws on unsupported platforms | `video_player_screen.dart:100,108` | Guard with try-catch |
 
 ## Known Issues
-- Same as previous session: no max-retry cap on queue pump, no file size validation, navigation-to-video crash guarded by try-catch (root cause unknown).
+- No max-retry cap on queue pump callback retries, no file size validation.
+- Native Kotlin layer: no upload resume (restarts from 0 on failure), 64KB buffer suboptimal for fast networks, UIDT jobs not persisted across reboot.
