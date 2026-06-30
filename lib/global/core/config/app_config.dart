@@ -11,5 +11,5 @@ class AppConfig {
       '914828544219-v3sbd8bcui352873r4teffmcme2dtmqs.apps.googleusercontent.com';
 
   /// Request timeout duration
-  static const Duration requestTimeout = Duration(seconds: 30);
+  static const Duration requestTimeout = Duration(seconds: 100);
 }
